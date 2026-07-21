@@ -5,10 +5,6 @@ subscriptions. Compares what a database *uniquely* provides against usage
 signals and produces a per-title recommendation (renew, negotiate, cancel)
 along with a full audit trail as a downloadable XLSX brief.
 
-Extracted from the [Howard-Tilton Memorial Library / Tulane
-Collection Analysis Suite](https://collection-analysis-suite-tul.streamlit.app/)
-for teams that only need the renewal workflow.
-
 ---
 
 ## What it does
