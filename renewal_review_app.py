@@ -1,13 +1,10 @@
 """Electronic Renewal Review — Standalone Streamlit App.
 
-Workflow E of the Howard-Tilton Memorial Library / Collection Oversight
-Committee analysis pipeline, packaged as its own single-file Streamlit app.
-For teams that only need the renewal workflow — no dashboard nav, no other
-tools, no home page. Uniqueness analysis + optional inline multi-database
-usage extraction + the decision matrix (renew / negotiate / cancel), all on
-one page.
+Uniqueness analysis + optional inline multi-database usage extraction +
+per-title renewal decisions (renew / negotiate / cancel) for electronic
+subscriptions, all on one page.
 
-Behaviorally identical to Workflow E in the full Collection Analysis Suite:
+Features:
 - Coverage math at day resolution (with a user-set "coverage as-of" cap)
 - Phantom-cancelled-DB exclusion picker
 - Per-title T/L/R protection with three modes (whole-subscription /
@@ -25,6 +22,7 @@ import pandas as pd
 import numpy as np
 import re
 import warnings
+import unicodedata
 from io import BytesIO
 from datetime import date, timedelta
 from collections import defaultdict
@@ -676,7 +674,7 @@ def _wfe_classify_uniqueness(df, coverage_col, group_col, title_disp_col,
 
     Wraps the same normalization + call used by page_overlap_analyzer so the
     workflow page produces identical results to the standalone tool.
-    excluded_databases lets Workflow E treat "phantom-active" subscriptions
+    excluded_databases lets the caller treat "phantom-active" subscriptions
     (already cancelled but still in the Alma coverage export) as gone before
     the redundancy math runs. coverage_as_of_date caps ongoing coverage
     claims so loss doesn't extend past a date the analyst can vouch for.
@@ -699,7 +697,7 @@ def _wfe_classify_uniqueness(df, coverage_col, group_col, title_disp_col,
 
 
 def _wfe_apply_decision_matrix(long_df, focus_db, tlr_keys, low_use_threshold):
-    """Apply the guide's Section 3 renew/negotiate/cancel matrix.
+    """Apply the per-title renew / negotiate / cancel decision matrix.
 
     T/L/R relevance is per-title: `tlr_keys` is a set of normalized title keys
     that the librarian has flagged as teaching/learning/research relevant. A
@@ -761,7 +759,7 @@ def _wfe_apply_decision_matrix(long_df, focus_db, tlr_keys, low_use_threshold):
                         "equivalent subscription exists at a lower cost.")
             return ("Cancel candidate",
                     "Sole source but unused and not T/L/R relevant — "
-                    "Workflow E exception applies.")
+                    "unused, not T/L/R relevant, sole-source exception applies.")
 
         if status == "Unique coverage":
             if tlr:
@@ -801,25 +799,21 @@ def _wfe_apply_decision_matrix(long_df, focus_db, tlr_keys, low_use_threshold):
 # ============================================================
 
 def page_workflow_e():
-    """Workflow E — Renewal-Driven Resource Review as a single-page walkthrough.
+    """Renewal-Driven Resource Review as a single-page walkthrough.
 
     Steps: setup → uniqueness (Step 1) → usage (Step 2, branch-agnostic) →
-    decision matrix aligned with the guide's Section 3. Coverage and usage
-    files uploaded here are held in session; the underlying overlap
-    classification and usage matching reuse the same functions the standalone
-    Overlap & Uniqueness tool calls, so results are identical to running the
-    two tools separately.
+    decision matrix (renew / negotiate / cancel-candidate). Coverage and usage
+    files uploaded here are held in session only.
     """
-    st.header("🅔 Workflow E — Renewal-Driven Resource Review")
+    st.header("🔄 Renewal-Driven Resource Review")
     st.markdown(
         "**Everything for one subscription's renewal on one page.** Setup, "
-        "uniqueness classification, usage triage, and the guide's decision "
-        "matrix — no tool-hopping."
+        "uniqueness classification, usage triage, and the renew / "
+        "negotiate / cancel decision matrix — no tool-hopping."
     )
     with st.expander("ℹ️ How this workflow works", expanded=False):
         st.markdown(
-            "This page walks through the four steps of Workflow E as described "
-            "in Section 3 of the Print & Electronic Resource Analysis Guide:\n\n"
+            "This page walks through the review in four steps:\n\n"
             "1. **Setup** — vendor, renewal deadline, and any T/L/R relevance "
             "note the data can't see.\n"
             "2. **Uniqueness (Step 1)** — upload the Alma coverage / A-to-Z "
@@ -828,9 +822,9 @@ def page_workflow_e():
             "3. **Usage (Step 2)** — upload a title-level usage file (COUNTER, "
             "non-COUNTER vendor report, Zero-Use master, or multi-database extract). "
             "Usage attaches to the uniqueness classification.\n"
-            "4. **Decision matrix** — the tool applies the guide's rules to "
-            "each title of the focus database and produces a renew / "
-            "negotiate / cancel-candidate breakdown, downloadable as a brief."
+            "4. **Decision matrix** — the tool applies renew / negotiate / "
+            "cancel-candidate rules to each title of the focus database and "
+            "produces a downloadable brief."
         )
 
     st.markdown("---")
@@ -1426,7 +1420,7 @@ def page_workflow_e():
         )
 
     csv_buf = BytesIO()
-    csv_buf.write(b"# Workflow E Renewal Review Brief\n")
+    csv_buf.write(b"# Renewal Review Brief\n")
     csv_buf.write(f"# Generated: {pd.Timestamp.now()}\n\n".encode('utf-8'))
     csv_buf.write(b"# ---- Setup ----\n")
     brief_header.to_csv(csv_buf, index=False)
@@ -1489,7 +1483,7 @@ def main():
             🔄 Electronic Renewal Review
           </div>
           <div style="font-size:0.9rem;opacity:0.9;margin-top:2px;">
-            Workflow E · Uniqueness + usage + decision matrix on one page
+            Uniqueness + usage + decision matrix on one page
           </div>
         </div>
         """,
