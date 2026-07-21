@@ -5,6 +5,10 @@ subscriptions. Compares what a database *uniquely* provides against usage
 signals and produces a per-title recommendation (renew, negotiate, cancel)
 along with a full audit trail as a downloadable XLSX brief.
 
+Extracted from the [Howard-Tilton Memorial Library / Tulane
+Collection Analysis Suite](https://collection-analysis-suite-tul.streamlit.app/)
+for teams that only need the renewal workflow.
+
 ---
 
 ## What it does
@@ -18,13 +22,10 @@ usage file, the tool:
 - Computes what you'd actually lose if you cancelled — at day resolution,
   capped at a date you can vouch for so Alma's stale "ongoing" claims
   don't inflate the picture
-- Applies the guide's decision matrix per-title with T/L/R protection and
+- Applies a per-title decision matrix with T/L/R protection and
   a 2.5-year threshold rule
 - Exports a multi-sheet XLSX brief you can share with liaisons and
   vendors
-
-Behaviorally identical to Workflow E in the full Collection Analysis
-Suite.
 
 ---
 
@@ -165,11 +166,10 @@ decisions:
 
 ## Context
 
-This is Workflow E from the *Print & Electronic Resource Analysis Guide*
-(Collection Oversight Committee, Howard-Tilton Memorial Library, Tulane
-University). The full guide covers six workflows (A–F) for the annual
-collection review cycle; this app implements just the subscription
-renewal piece.
+Developed at Howard-Tilton Memorial Library, Tulane University, as part
+of the Collection Oversight Committee's annual review cycle. This app
+implements the subscription-renewal portion of that cycle as a
+standalone tool.
 
 For teams that need the full pipeline — annual print snapshot, ILL
 review, ebook snapshot, vendor mapping, watchlist/wishlist lifecycle —
