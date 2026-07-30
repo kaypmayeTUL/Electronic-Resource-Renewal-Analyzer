@@ -9,7 +9,7 @@ Features:
 - Phantom-cancelled-DB exclusion picker
 - Per-title T/L/R protection with three modes (whole-subscription /
   specific-titles-uploaded / not-applicable)
-- Decision matrix with 2.5-year threshold + T/L/R override
+- Decision matrix with adjustable renewal-worthy threshold + T/L/R override
 - Multi-vendor usage extraction (ProQuest, EBSCO, similar stacked .xls)
 - Multi-sheet XLSX brief export
 
@@ -696,7 +696,8 @@ def _wfe_classify_uniqueness(df, coverage_col, group_col, title_disp_col,
         coverage_as_of_date=coverage_as_of_date)
 
 
-def _wfe_apply_decision_matrix(long_df, focus_db, tlr_keys, low_use_threshold):
+def _wfe_apply_decision_matrix(long_df, focus_db, tlr_keys, low_use_threshold,
+                               renewal_worthy_threshold=1.5):
     """Apply the per-title renew / negotiate / cancel decision matrix.
 
     T/L/R relevance is per-title: `tlr_keys` is a set of normalized title keys
@@ -705,15 +706,20 @@ def _wfe_apply_decision_matrix(long_df, focus_db, tlr_keys, low_use_threshold):
     whole subscription is flagged. Pass an empty set for "no titles protected"
     or the full title-key set for "everything protected."
 
+    `renewal_worthy_threshold` is the minimum unique-coverage span (in years)
+    a title must contribute for the subscription to be worth keeping on its
+    account. Contextual — depends on subscription cost, user community, and
+    what alternatives exist. Default 1.5 is a starting point, not a rule.
+
     Rule order (per-title against the focus DB's placements):
       1. T/L/R flag protects sole-source and unique-coverage titles — always
          wins (whether used or unused, whether coverage is thin or thick).
          The librarian's explicit institutional signal beats the automated
          rules.
-      2. Below-threshold rule: if unique-loss coverage is < 2.5 years, the
-         title falls to Cancel candidate even when sole-source or used.
-         Rationale: a fraction of a subscription's worth of unique material
-         doesn't justify the subscription cost.
+      2. Renewal-worthy threshold: if unique-loss coverage is below the
+         threshold, the title falls to Cancel candidate even when sole-source
+         or used. Rationale: a fraction of a subscription's worth of unique
+         material doesn't justify the subscription cost.
       3. Otherwise, follow the standard matrix:
          - Sole source + used            → Renew or find equivalent subscription
          - Sole source + unused          → Cancel candidate
@@ -732,7 +738,7 @@ def _wfe_apply_decision_matrix(long_df, focus_db, tlr_keys, low_use_threshold):
     sub["_tlr_row"] = sub["title"].apply(
         lambda t: normalize_text(t) in tlr_keys if pd.notna(t) else False)
 
-    MIN_UNIQUE_YEARS = 2.5
+    MIN_UNIQUE_YEARS = renewal_worthy_threshold
 
     def _row_decision(r):
         status = r["status"]
@@ -1189,6 +1195,18 @@ def page_workflow_e():
     # =============================================================
     st.subheader("4️⃣ Decision matrix")
 
+    renewal_worthy_threshold = st.number_input(
+        "Renewal-worthy threshold — minimum unique coverage per title to justify the subscription (years):",
+        min_value=0.0, max_value=10.0, value=1.5, step=0.25,
+        key="wfe_renewal_worthy_thresh",
+        help="If a sole-source or unique-coverage title contributes less than "
+             "this many years of unique material, it falls to Cancel candidate "
+             "regardless of usage. Contextual — what counts as 'worth it' "
+             "depends on subscription cost, user community, and what "
+             "alternatives exist. T/L/R-protected titles are never dropped on "
+             "this rule alone."
+    )
+
     low_use_threshold = st.number_input(
         "Low-use threshold (uses per title to treat as 'used' for redundant titles):",
         min_value=1, max_value=1000, value=5, step=1, key="wfe_low_use_thresh",
@@ -1308,7 +1326,10 @@ def page_workflow_e():
         st.info("**T/L/R protection: none** — the decision matrix runs on "
                 "uniqueness × usage alone.")
 
-    decision_df = _wfe_apply_decision_matrix(long_df, focus_db, tlr_keys, low_use_threshold)
+    decision_df = _wfe_apply_decision_matrix(
+        long_df, focus_db, tlr_keys, low_use_threshold,
+        renewal_worthy_threshold=renewal_worthy_threshold,
+    )
 
     # Summary counts
     dcounts = decision_df["Decision"].value_counts()
@@ -1405,6 +1426,7 @@ def page_workflow_e():
          'Value': ', '.join(excluded_dbs) if excluded_dbs else '(none)'},
         {'Field': 'Usage source', 'Value': usage_source_desc or '(none — uniqueness only)'},
         {'Field': 'Materiality threshold (yrs)', 'Value': str(min_years)},
+        {'Field': 'Renewal-worthy threshold (yrs)', 'Value': str(renewal_worthy_threshold)},
         {'Field': 'Low-use threshold', 'Value': str(low_use_threshold) if has_usage else '—'},
         {'Field': 'Titles reviewed', 'Value': f"{len(decision_df):,}"},
         {'Field': 'Recommend RENEW (all types)', 'Value': f"{_renew_total:,}"},
