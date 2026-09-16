@@ -11,6 +11,9 @@ Features:
   specific-titles-uploaded / not-applicable)
 - Decision matrix with adjustable renewal-worthy threshold + T/L/R override
 - Multi-vendor usage extraction (ProQuest, EBSCO, similar stacked .xls)
+- Suggested title matches for usage and T/L/R titles that don't match the
+  coverage export exactly — applied only when the user approves them, and
+  recorded in the brief (standard library only; no extra dependency)
 - Multi-sheet XLSX brief export
 
 Deploy: `pip install streamlit pandas openpyxl xlrd plotly` and
@@ -28,6 +31,8 @@ from datetime import date, timedelta
 from collections import defaultdict
 import hashlib
 import csv
+import math
+from difflib import SequenceMatcher
 
 warnings.filterwarnings('ignore')
 
@@ -633,15 +638,18 @@ def _ovl_cached_classification(tool_key, uploaded_file, group_col,
 
 
 def _wfe_build_usage_map(usage_df):
-    """Return {normalized_title: total_uses} from an arbitrary usage DataFrame.
+    """Return ({normalized_title: total_uses}, title_col, weight_col, {normalized_title: title as written})
+    from an arbitrary usage DataFrame.
 
     Handles files with a single weight column and files with per-year usage
     columns (from Zero-Use Identifier / Multi-Database Usage Extractor output) — sums the
-    per-year columns when no single-total column is present.
+    per-year columns when no single-total column is present. The display-title
+    map keeps the first spelling seen for each key, for showing unmatched titles.
     """
     usage_map = {}
+    display = {}
     if usage_df is None or usage_df.empty:
-        return usage_map, None, None
+        return usage_map, None, None, display
     u_title_col = find_column(usage_df, TITLE_ALIASES)
     u_weight_col = find_column(usage_df, WEIGHT_ALIASES)
     u_peryear = _detect_per_year_usage_columns(usage_df)
@@ -653,7 +661,7 @@ def _wfe_build_usage_map(usage_df):
             .fillna(0).sum(axis=1))
         u_weight_col = '_total_uses'
     if not (u_title_col and u_weight_col):
-        return usage_map, u_title_col, u_weight_col
+        return usage_map, u_title_col, u_weight_col, display
     for _, r in usage_df.iterrows():
         raw_t = r[u_title_col]
         if pd.isna(raw_t):
@@ -663,7 +671,213 @@ def _wfe_build_usage_map(usage_df):
             continue
         v = pd.to_numeric(r[u_weight_col], errors='coerce')
         usage_map[k] = usage_map.get(k, 0) + (int(v) if pd.notna(v) else 0)
-    return usage_map, u_title_col, u_weight_col
+        display.setdefault(k, str(raw_t).strip())
+    return usage_map, u_title_col, u_weight_col, display
+
+
+# ------------------------------------------------------------
+# Fuzzy title matching — suggestions only; nothing applies until approved
+# ------------------------------------------------------------
+
+# Words ignored when deciding whether two titles are "the same words"
+_MATCH_IGNORED_WORDS = frozenset({"the", "a", "an", "and"})
+# Words too common to find candidate matches with
+_MATCH_BLOCKING_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "of", "for", "in", "on", "to", "with", "at", "by",
+    "journal", "review", "studies", "international", "quarterly",
+})
+
+
+def _loose_title(key):
+    """A normalized title with '&'/'and' and articles removed:
+    'journal of the race incarceration' and 'journal of race and incarceration'
+    both become 'journal of race incarceration'."""
+    return " ".join(w for w in key.split() if w not in _MATCH_IGNORED_WORDS)
+
+
+_REASON_SAME = "Same words; differs only in punctuation, “&”/“and”, or articles"
+_REASON_ORDER = "Same words in a different order"
+_REASON_PREFIX = "One title is the start of the other (truncated, or subtitle added/dropped)"
+_REASON_SPELLING = "Similar spelling"
+
+
+def _score_loose(a, b, a_sorted, b_sorted, min_score, matcher, matcher_sorted):
+    """
+    Score two loose titles (see _loose_title) 0–100; returns (score, reason),
+    or (0, "") when the pair can't reach min_score.
+
+    100  same words once punctuation, '&'/'and', and articles are ignored
+     97  same words in a different order
+    ≥90  one title is the start of the other (truncated vendor title, or an
+         added/dropped subtitle) — only when the shorter is 15+ characters
+    else character similarity (difflib ratio), the better of as-written and
+         word-sorted comparisons
+
+    `matcher` / `matcher_sorted` are SequenceMatchers with seq2 already set to
+    b / b_sorted, so difflib's per-sequence preprocessing is reused, and the
+    cheap quick_ratio upper bound skips pairs that can't reach min_score.
+    """
+    if not a or not b:
+        return 0, ""
+    if a == b:
+        return 100, _REASON_SAME
+    if a_sorted == b_sorted:
+        return 97, _REASON_ORDER
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    prefix = len(short) >= 15 and long_.startswith(short)
+    floor = min_score / 100
+    best = 0.0
+    for m, x in ((matcher, a), (matcher_sorted, a_sorted)):
+        m.set_seq1(x)
+        if m.real_quick_ratio() >= floor and m.quick_ratio() >= floor:
+            best = max(best, m.ratio())
+    score = round(best * 100)
+    if prefix:
+        return max(score, 90), _REASON_PREFIX
+    return (score, _REASON_SPELLING) if score >= min_score else (0, "")
+
+
+def _title_match_score(a_key, b_key):
+    """Score two normalized titles 0–100 and say why they look alike (see _score_loose)."""
+    a, b = _loose_title(a_key), _loose_title(b_key)
+    a_sorted, b_sorted = " ".join(sorted(a.split())), " ".join(sorted(b.split()))
+    m, ms = SequenceMatcher(None), SequenceMatcher(None)
+    m.set_seq2(b); ms.set_seq2(b_sorted)
+    return _score_loose(a, b, a_sorted, b_sorted, 0, m, ms)
+
+
+def _blocking_tokens(key):
+    """Words plus 4-letter word prefixes, so a misspelled word ('crimonology')
+    can still find its match ('criminology') through the shared prefix."""
+    out = set()
+    for w in key.split():
+        if w in _MATCH_BLOCKING_STOPWORDS or len(w) < 2:
+            continue
+        out.add(w)
+        if len(w) >= 5:
+            out.add(w[:4] + "*")
+    return out
+
+
+@st.cache_data(show_spinner=False)
+def _suggest_title_matches(sources, targets, min_score=85, candidates_per_source=60):
+    """
+    For each source title with no exact match, find the closest target title.
+
+    sources, targets: tuples of titles as written. Returns a DataFrame with one
+    row per source that has a match scoring >= min_score:
+      source, source_key, target, target_key, score, reason, other_matches
+    Candidate targets are pre-filtered by shared words (weighted by rarity),
+    so large packages don't need an all-pairs comparison.
+    """
+    cols = ["source", "source_key", "target", "target_key", "score", "reason", "other_matches"]
+    tgt = {}
+    for t in targets:
+        k = normalize_text(t)
+        if k:
+            tgt.setdefault(k, t)
+    if not sources or not tgt:
+        return pd.DataFrame(columns=cols)
+    tgt_keys = list(tgt)
+    tgt_loose = [_loose_title(k) for k in tgt_keys]
+    tgt_sorted = [" ".join(sorted(x.split())) for x in tgt_loose]
+    index = defaultdict(list)
+    for i, k in enumerate(tgt_keys):
+        for tok in _blocking_tokens(k):
+            index[tok].append(i)
+    n = len(tgt_keys)
+
+    rows = []
+    for src in dict.fromkeys(sources):
+        s_key = normalize_text(src)
+        if not s_key or s_key in tgt:
+            continue
+        s_loose = _loose_title(s_key)
+        s_sorted = " ".join(sorted(s_loose.split()))
+        weights = defaultdict(float)
+        for tok in _blocking_tokens(s_key):
+            hits = index.get(tok, ())
+            if hits:
+                w = math.log(1 + n / len(hits))
+                for i in hits:
+                    weights[i] += w
+        shortlist = sorted(weights, key=weights.get, reverse=True)[:candidates_per_source]
+        matcher, matcher_sorted = SequenceMatcher(None), SequenceMatcher(None)
+        matcher.set_seq2(s_loose)
+        matcher_sorted.set_seq2(s_sorted)
+        scored = []
+        for i in shortlist:
+            score, reason = _score_loose(tgt_loose[i], s_loose, tgt_sorted[i], s_sorted,
+                                         min_score, matcher, matcher_sorted)
+            if score >= min_score and score > 0:
+                scored.append((score, tgt_keys[i], reason))
+        if not scored:
+            continue
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        best_score, best_key, reason = scored[0]
+        others = "; ".join(f"{tgt[k]} ({sc})" for sc, k, _ in scored[1:3])
+        rows.append({"source": src, "source_key": s_key, "target": tgt[best_key],
+                     "target_key": best_key, "score": best_score, "reason": reason,
+                     "other_matches": others})
+    out = pd.DataFrame(rows, columns=cols)
+    return out.sort_values(["score", "source"], ascending=[False, True]).reset_index(drop=True)
+
+
+def _render_match_approval(kind, suggestions, source_label, extra=None):
+    """
+    Show suggested title matches with an Approve checkbox per row and return
+    the approved rows. Nothing is pre-approved.
+
+    Approvals are stored in st.session_state as (source_key, target_key) pairs,
+    so they survive reruns and changes to the score threshold. Each editor's
+    seed data is frozen per suggestion set because Streamlit resets a data
+    editor whenever its data changes.
+
+    kind: short state namespace ("usage", "tlr"); extra: optional dict of
+    {column label: sequence aligned to suggestion rows} shown alongside.
+    """
+    approved = st.session_state.setdefault(f"wfe_match_{kind}_approved", set())
+    if suggestions.empty:
+        return suggestions
+    pairs = list(zip(suggestions["source_key"], suggestions["target_key"]))
+    sig = hashlib.md5(repr(pairs).encode()).hexdigest()[:12]
+    ver_key = f"wfe_match_{kind}_ver"
+    st.session_state.setdefault(ver_key, 0)
+
+    b1, b2, _ = st.columns([1.4, 1, 2])
+    if b1.button("Approve all score-100 matches", key=f"wfe_match_{kind}_all100",
+                 help="Titles whose words are identical once punctuation, “&”/“and”, and articles are ignored."):
+        approved.update(p for p, sc in zip(pairs, suggestions["score"]) if sc == 100)
+        st.session_state[ver_key] += 1
+    if b2.button("Clear approvals", key=f"wfe_match_{kind}_clear"):
+        approved.difference_update(pairs)
+        st.session_state[ver_key] += 1
+
+    editor_key = f"wfe_match_{kind}_editor_{sig}_{st.session_state[ver_key]}"
+    seed = st.session_state.setdefault(f"{editor_key}_seed", [p in approved for p in pairs])
+    view = pd.DataFrame({
+        "Approve": seed,
+        source_label: suggestions["source"],
+        "Suggested coverage title": suggestions["target"],
+        "Score": suggestions["score"],
+        "Why": suggestions["reason"],
+    })
+    for label, values in (extra or {}).items():
+        view[label] = list(values)
+    view["Other close matches"] = suggestions["other_matches"]
+    edited = st.data_editor(
+        view, key=editor_key, hide_index=True, use_container_width=True,
+        disabled=[c for c in view.columns if c != "Approve"],
+        column_config={
+            "Approve": st.column_config.CheckboxColumn("Approve", help="Tick to use this match."),
+            "Score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d"),
+        },
+        height=min(460, 40 + 35 * len(view)),
+    )
+    now = {p for p, ok in zip(pairs, edited["Approve"]) if ok}
+    approved.difference_update(pairs)
+    approved.update(now)
+    return suggestions[[p in now for p in pairs]].reset_index(drop=True)
 
 
 def _wfe_classify_uniqueness(df, coverage_col, group_col, title_disp_col,
@@ -1073,6 +1287,7 @@ def page_workflow_e():
     )
 
     usage_map = {}
+    usage_display = {}   # normalized key -> title as written in the usage file
     usage_source_desc = None
 
     if usage_source == "Upload usage file directly":
@@ -1091,7 +1306,7 @@ def page_workflow_e():
                     usage_df_raw = pd.read_excel(BytesIO(usage_file.getvalue()), engine=engine)
                 else:
                     usage_df_raw = _load_csv_chunked(usage_file.getvalue(), usage_file.name)
-                usage_map, u_title_col, u_weight_col = _wfe_build_usage_map(usage_df_raw)
+                usage_map, u_title_col, u_weight_col, usage_display = _wfe_build_usage_map(usage_df_raw)
                 if u_title_col and u_weight_col:
                     usage_source_desc = (
                         f"`{usage_file.name}` (title=`{u_title_col}`, "
@@ -1153,6 +1368,7 @@ def page_workflow_e():
                         k = normalize_text(title)
                         if k:
                             usage_map[k] = usage_map.get(k, 0) + use_total
+                            usage_display.setdefault(k, title)
                     usage_source_desc = (
                         f"Multi-database extract — {len(pq_files)} file(s), "
                         f"{matched_sections} matching section(s) for '{focus_db}', "
@@ -1168,6 +1384,72 @@ def page_workflow_e():
                         f"Check that the focus database name aligns with a "
                         f"section name in the file."
                     )
+
+    # Used titles that don't exactly match the focus database: suggest matches
+    usage_matches = pd.DataFrame(columns=["source", "source_key", "target", "target_key", "score", "reason"])
+    if usage_map:
+        focus_rows = long_df[long_df["database"] == focus_db]
+        focus_title_list = tuple(focus_rows["title"].dropna().astype(str).unique())
+        status_by_key = {normalize_text(t): st_ for t, st_ in zip(focus_rows["title"], focus_rows["status"])}
+        unmatched_used = sorted(
+            (usage_display.get(k, k) for k, v in usage_map.items() if v > 0 and k not in status_by_key),
+            key=lambda t: -usage_map[normalize_text(t)],
+        )
+        if unmatched_used:
+            usage_suggestions = _suggest_title_matches(
+                tuple(unmatched_used), focus_title_list,
+                st.session_state.get("wfe_match_usage_min", 85),
+            )
+            unmatched_total = sum(usage_map[normalize_text(t)] for t in unmatched_used)
+            with st.expander(
+                f"🔍 {len(unmatched_used):,} used title(s) ({unmatched_total:,} uses) don't exactly "
+                f"match '{focus_db}' — {len(usage_suggestions):,} possible match(es) to review",
+                expanded=not usage_suggestions.empty,
+            ):
+                st.caption(
+                    "These titles have uses in the usage file but no exact match in the coverage "
+                    "export, so right now their uses count for nothing. Each is paired with the "
+                    "closest coverage title. **Nothing changes until you approve a match.** "
+                    "Approved uses are added to the coverage title and listed in the exported brief. "
+                    "Check score-90 “start of the other” matches carefully: "
+                    "*Journal of Criminal Law* and *Journal of Criminal Law and Criminology* are "
+                    "different journals."
+                )
+                st.slider(
+                    "Minimum match score", 70, 100, 85, key="wfe_match_usage_min",
+                    help="Lower finds more possible matches, including more wrong ones. "
+                         "Approvals are kept when you change this.",
+                )
+                if usage_suggestions.empty:
+                    st.info("No coverage titles are close enough at this score.")
+                else:
+                    usage_matches = _render_match_approval(
+                        "usage", usage_suggestions, "Title in usage file",
+                        extra={
+                            "Uses in file": usage_suggestions["source_key"].map(usage_map),
+                            "Coverage title's own uses": usage_suggestions["target_key"].map(
+                                lambda k: usage_map.get(k, 0)),
+                            "Uniqueness": usage_suggestions["target_key"].map(status_by_key),
+                        },
+                    )
+                approved_sources = set(usage_matches["source_key"])
+                still = [t for t in unmatched_used if normalize_text(t) not in approved_sources]
+                if still:
+                    st.markdown(f"**Still unmatched ({len(still):,})** — these uses aren't counted:")
+                    st.dataframe(
+                        pd.DataFrame({"Title in usage file": still,
+                                      "Uses": [usage_map[normalize_text(t)] for t in still]}),
+                        use_container_width=True, hide_index=True, height=min(300, 40 + 35 * len(still)),
+                    )
+            if not usage_matches.empty:
+                moved = 0
+                for s_key, t_key in zip(usage_matches["source_key"], usage_matches["target_key"]):
+                    usage_map[t_key] = usage_map.get(t_key, 0) + usage_map.get(s_key, 0)
+                    moved += usage_map.get(s_key, 0)
+                usage_matches = usage_matches.assign(
+                    uses_moved=usage_matches["source_key"].map(usage_map))
+                st.success(f"✅ {len(usage_matches):,} approved title match(es) added "
+                           f"{moved:,} uses to coverage titles.")
 
     # Attach usage to long_df
     has_usage = bool(usage_map)
@@ -1227,6 +1509,7 @@ def page_workflow_e():
     tlr_keys = set()
     tlr_upload_keys = set()
     tlr_upload_summary = None
+    tlr_matches = pd.DataFrame(columns=["source", "source_key", "target", "target_key", "score", "reason"])
     if tlr_list_file is not None and tlr_mode.startswith("Specific"):
         try:
             if tlr_list_file.name.lower().endswith(('.xls', '.xlsx')):
@@ -1235,31 +1518,63 @@ def page_workflow_e():
             else:
                 tlr_df_raw = _load_csv_chunked(tlr_list_file.getvalue(), tlr_list_file.name)
             t_col = find_column(tlr_df_raw, TITLE_ALIASES) or tlr_df_raw.columns[0]
+            tlr_display = {}
             for raw_t in tlr_df_raw[t_col].dropna():
                 k = normalize_text(raw_t)
                 if k:
                     tlr_upload_keys.add(k)
-            matched = tlr_upload_keys & set(focus_placements["_key"].dropna())
+                    tlr_display.setdefault(k, str(raw_t).strip())
+            focus_key_set = set(focus_placements["_key"].dropna())
+            matched = tlr_upload_keys & focus_key_set
             unmatched = tlr_upload_keys - matched
+            if unmatched:
+                tlr_suggestions = _suggest_title_matches(
+                    tuple(tlr_display[k] for k in sorted(unmatched)),
+                    tuple(focus_placements["title"].dropna().astype(str).unique()),
+                    st.session_state.get("wfe_match_tlr_min", 85),
+                )
+                with st.expander(
+                    f"⚠️ {len(unmatched):,} T/L/R titles not found in '{focus_db}' — "
+                    f"{len(tlr_suggestions):,} possible match(es) to review",
+                    expanded=not tlr_suggestions.empty,
+                ):
+                    st.caption(
+                        "These list titles have no exact match in the coverage export. Each is "
+                        "paired with the closest coverage title. **Nothing changes until you "
+                        "approve a match.** Approved titles are pre-ticked in the T/L/R editor "
+                        "below when they appear there, and listed in the exported brief."
+                    )
+                    st.slider(
+                        "Minimum match score", 70, 100, 85, key="wfe_match_tlr_min",
+                        help="Lower finds more possible matches, including more wrong ones. "
+                             "Approvals are kept when you change this.",
+                    )
+                    if tlr_suggestions.empty:
+                        st.info("No coverage titles are close enough at this score.")
+                    else:
+                        status_by_key = dict(zip(focus_placements["_key"], focus_placements["status"]))
+                        tlr_extra = {"Uniqueness": tlr_suggestions["target_key"].map(status_by_key)}
+                        if "uses" in focus_placements.columns:
+                            uses_by_key = dict(zip(focus_placements["_key"], focus_placements["uses"]))
+                            tlr_extra["Uses"] = tlr_suggestions["target_key"].map(uses_by_key)
+                        tlr_matches = _render_match_approval(
+                            "tlr", tlr_suggestions, "Title in T/L/R list", extra=tlr_extra)
+                    still = sorted(tlr_display[k] for k in unmatched - set(tlr_matches["source_key"]))
+                    if still:
+                        st.markdown(f"**Still unmatched ({len(still):,})** — check spelling, or "
+                                    "tick the title in the editor below if it's there under another name:")
+                        st.dataframe(pd.DataFrame({"Unmatched T/L/R title": still}),
+                                     use_container_width=True, hide_index=True)
+            approved_targets = set(tlr_matches["target_key"])
+            tlr_upload_keys |= approved_targets
+            n_matched = len(matched) + len(set(tlr_matches["source_key"]))
             tlr_upload_summary = (
                 f"Uploaded T/L/R list `{tlr_list_file.name}` "
                 f"(title column: `{t_col}`) — "
-                f"**{len(matched):,}** of {len(tlr_upload_keys):,} titles matched "
-                f"the focus database."
+                f"**{n_matched:,}** of {len(tlr_display):,} titles matched "
+                f"the focus database"
+                + (f" ({len(tlr_matches):,} by approved suggestion)." if len(tlr_matches) else ".")
             )
-            if unmatched:
-                with st.expander(
-                    f"⚠️ {len(unmatched):,} T/L/R titles not found in '{focus_db}'"
-                ):
-                    st.caption(
-                        "These titles didn't match anything in the coverage export. "
-                        "Check spelling, or add them separately via the interactive "
-                        "editor below."
-                    )
-                    st.dataframe(
-                        pd.DataFrame({'Unmatched T/L/R title': sorted(unmatched)}),
-                        use_container_width=True, hide_index=True
-                    )
         except Exception as e:
             st.warning(f"Couldn't parse T/L/R list: {e}")
 
@@ -1425,6 +1740,9 @@ def page_workflow_e():
         {'Field': 'Excluded (already-cancelled) databases',
          'Value': ', '.join(excluded_dbs) if excluded_dbs else '(none)'},
         {'Field': 'Usage source', 'Value': usage_source_desc or '(none — uniqueness only)'},
+        {'Field': 'Approved title matches',
+         'Value': (f"{len(usage_matches):,} usage · {len(tlr_matches):,} T/L/R"
+                   if len(usage_matches) or len(tlr_matches) else '(none)')},
         {'Field': 'Materiality threshold (yrs)', 'Value': str(min_years)},
         {'Field': 'Renewal-worthy threshold (yrs)', 'Value': str(renewal_worthy_threshold)},
         {'Field': 'Low-use threshold', 'Value': str(low_use_threshold) if has_usage else '—'},
@@ -1441,6 +1759,18 @@ def page_workflow_e():
             focus_placements[focus_placements["_key"].isin(tlr_keys)]["title"].unique()
         )
 
+    match_rows = []
+    for _, m in usage_matches.iterrows():
+        match_rows.append({'List': 'Usage file', 'Title in file': m['source'],
+                           'Matched to coverage title': m['target'], 'Score': m['score'],
+                           'Why': m['reason'], 'Uses added': int(m.get('uses_moved', 0))})
+    for _, m in tlr_matches.iterrows():
+        match_rows.append({'List': 'T/L/R list', 'Title in file': m['source'],
+                           'Matched to coverage title': m['target'], 'Score': m['score'],
+                           'Why': m['reason'], 'Uses added': None})
+    title_matches_df = pd.DataFrame(match_rows, columns=[
+        'List', 'Title in file', 'Matched to coverage title', 'Score', 'Why', 'Uses added'])
+
     csv_buf = BytesIO()
     csv_buf.write(b"# Renewal Review Brief\n")
     csv_buf.write(f"# Generated: {pd.Timestamp.now()}\n\n".encode('utf-8'))
@@ -1449,6 +1779,9 @@ def page_workflow_e():
     if tlr_titles_list:
         csv_buf.write(b"\n# ---- T/L/R protected titles ----\n")
         pd.DataFrame({'T/L/R protected title': tlr_titles_list}).to_csv(csv_buf, index=False)
+    if not title_matches_df.empty:
+        csv_buf.write(b"\n# ---- Approved title matches ----\n")
+        title_matches_df.to_csv(csv_buf, index=False)
     csv_buf.write(b"\n# ---- Per-title decisions ----\n")
     dcsv = decision_df.rename(columns={
         "title": "Title", "status": "Uniqueness", "uses": "Uses",
@@ -1477,6 +1810,8 @@ def page_workflow_e():
             if tlr_titles_list:
                 pd.DataFrame({'T/L/R protected title': tlr_titles_list}).to_excel(
                     writer, sheet_name='T_L_R titles', index=False)
+            if not title_matches_df.empty:
+                title_matches_df.to_excel(writer, sheet_name='Title matches', index=False)
         st.download_button(
             "📥 Renewal review brief (XLSX, multi-sheet)",
             xbuf.getvalue(),
